@@ -29,10 +29,18 @@ HTML_CONTENT = """<!DOCTYPE html>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { height: 100%; width: 100%; overflow: hidden; background: #1a1a2e; }
+        #map-container {
+            width: 100%; height: 100%;
+            overflow: hidden;
+            position: relative;
+        }
         #map {
             width: 100%; height: 100%;
             background: linear-gradient(135deg, #1a3a52 0%, #0d1b2a 50%, #1a1a2e 100%);
-            position: relative;
+            position: absolute;
+            top: 0;
+            left: 0;
+            transform-origin: 0 0;
         }
         .grid-line { position: absolute; border-color: rgba(0, 217, 255, 0.1); border-style: solid; }
         .path-point {
@@ -87,28 +95,56 @@ HTML_CONTENT = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <div id=\"map\"></div>
-    <div id=\"live-coords\">Emitters: none</div>
+    <div id="map-container">
+        <div id="map"></div>
+        <div id="live-coords">Emitters: none</div>
+    </div>
     <script>
+        var mapContainer = document.getElementById('map-container');
         var mapEl = document.getElementById('map');
         var coordsEl = document.getElementById('live-coords');
         var pathPoints = [];
         var emitters = {};
         var isDraggingEmitter = null;
         var dragOffset = {x: 0, y: 0};
+        
+        // Zoom and pan state
+        var zoomLevel = 1.0;
+        var panX = 0;
+        var panY = 0;
+        var MIN_ZOOM = 0.5;
+        var MAX_ZOOM = 3.0;
+        var isPanning = false;
+        var panStartX = 0;
+        var panStartY = 0;
+        var panStartMapX = 0;
+        var panStartMapY = 0;
+        
+        // Base map dimensions (these never change)
+        var baseWidth = 0;
+        var baseHeight = 0;
+        
+        // Get actual container dimensions for coordinate conversion
+        function getMapDimensions() {
+            return {
+                width: mapContainer.clientWidth,
+                height: mapContainer.clientHeight
+            };
+        }
+        
         var EMITTER_COLORS = ['#ef476f', '#06d6a0', '#ffd166', '#118ab2', '#f3722c', '#9b5de5'];
         var EMITTER_ICON_TEMPLATES = [
-            '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 28 28\"><circle cx=\"14\" cy=\"14\" r=\"11\" fill=\"{color}\"/><circle cx=\"14\" cy=\"14\" r=\"4\" fill=\"#0b1320\"/></svg>',
-            '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 28 28\"><rect x=\"4\" y=\"4\" width=\"20\" height=\"20\" rx=\"3\" fill=\"{color}\"/><rect x=\"10\" y=\"10\" width=\"8\" height=\"8\" fill=\"#0b1320\"/></svg>',
-            '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 28 28\"><polygon points=\"14,2 26,14 14,26 2,14\" fill=\"{color}\"/><circle cx=\"14\" cy=\"14\" r=\"3.8\" fill=\"#0b1320\"/></svg>',
-            '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 28 28\"><polygon points=\"14,2 17.5,10 26,10.5 19.5,16 21.8,25 14,20.5 6.2,25 8.5,16 2,10.5 10.5,10\" fill=\"{color}\"/></svg>'
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><circle cx="14" cy="14" r="11" fill="{color}"/><circle cx="14" cy="14" r="4" fill="#0b1320"/></svg>',
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect x="4" y="4" width="20" height="20" rx="3" fill="{color}"/><rect x="10" y="10" width="8" height="8" fill="#0b1320"/></svg>',
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><polygon points="14,2 26,14 14,26 2,14" fill="{color}"/><circle cx="14" cy="14" r="3.8" fill="#0b1320"/></svg>',
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><polygon points="14,2 17.5,10 26,10.5 19.5,16 21.8,25 14,20.5 6.2,25 8.5,16 2,10.5 10.5,10" fill="{color}"/></svg>'
         ];
 
         function emitterIconDataUri(id) {
             var color = EMITTER_COLORS[(id - 1) % EMITTER_COLORS.length];
             var template = EMITTER_ICON_TEMPLATES[(id - 1) % EMITTER_ICON_TEMPLATES.length];
             var svg = template.replace('{color}', color);
-            return \"url('data:image/svg+xml;utf8,\" + encodeURIComponent(svg) + \"')\";
+            return "url('data:image/svg+xml;utf8," + encodeURIComponent(svg) + "')";
         }
 
         function updateEmitterCoordsPanel() {
@@ -120,37 +156,51 @@ HTML_CONTENT = """<!DOCTYPE html>
             var lines = ids.map(function(id) {
                 var m = emitters[id];
                 return (
-                    '<span class=\"emitter-id\">E' + id + '</span> ' +
-                    '<span class=\"lat-label\">Lat</span>: ' +
-                    '<span class=\"lat-val\">' + Number(m.dataset.lat).toFixed(6) + '</span> ' +
-                    '<span class=\"lng-label\">Lng</span>: ' +
-                    '<span class=\"lng-val\">' + Number(m.dataset.lng).toFixed(6) + '</span>'
+                    '<span class="emitter-id">E' + id + '</span> ' +
+                    '<span class="lat-label">Lat</span>: ' +
+                    '<span class="lat-val">' + Number(m.dataset.lat).toFixed(6) + '</span> ' +
+                    '<span class="lng-label">Lng</span>: ' +
+                    '<span class="lng-val">' + Number(m.dataset.lng).toFixed(6) + '</span>'
                 );
             });
             coordsEl.innerHTML = lines.join('<br>');
         }
 
-        // Convert lat/lng to pixel (simple projection)
+        // Convert lat/lng to pixel coordinates
+        // This uses the BASE map dimensions, independent of zoom/pan
         function latLngToPixel(lat, lng) {
-            var x = (lng + 180) * (mapEl.offsetWidth / 360);
-            var y = ((90 - lat) * (mapEl.offsetHeight / 180));
+            var dims = getMapDimensions();
+            var x = (lng + 180) * (dims.width / 360);
+            var y = ((90 - lat) * (dims.height / 180));
             return {x: x, y: y};
         }
 
         // Convert pixel to lat/lng
-        function pixelToLatLng(x, y) {
-            var lng = (x / (mapEl.offsetWidth / 360)) - 180;
-            var lat = 90 - (y / (mapEl.offsetHeight / 180));
+        // This uses viewport-relative coordinates, accounting for zoom/pan
+        function pixelToLatLng(viewportX, viewportY) {
+            var dims = getMapDimensions();
+            // Convert from viewport coordinates to map coordinates
+            var mapX = (viewportX - panX) / zoomLevel;
+            var mapY = (viewportY - panY) / zoomLevel;
+            var lng = (mapX / (dims.width / 360)) - 180;
+            var lat = 90 - (mapY / (dims.height / 180));
             return {lat: lat, lng: lng};
         }
 
+        // Update map transform based on zoom and pan
+        function updateMapTransform() {
+            mapEl.style.transform = 'translate(' + panX + 'px, ' + panY + 'px) scale(' + zoomLevel + ')';
+        }
+
         // Right click to add path point
-        mapEl.addEventListener('contextmenu', function(e) {
+        mapContainer.addEventListener('contextmenu', function(e) {
             e.preventDefault();
-            var rect = mapEl.getBoundingClientRect();
-            var x = e.clientX - rect.left;
-            var y = e.clientY - rect.top;
-            pathPoints.push({x: x, y: y});
+            var rect = mapContainer.getBoundingClientRect();
+            var viewportX = e.clientX - rect.left;
+            var viewportY = e.clientY - rect.top;
+            // Convert viewport coordinates to lat/lng
+            var latlng = pixelToLatLng(viewportX, viewportY);
+            pathPoints.push({lat: latlng.lat, lng: latlng.lng});
             renderPath();
         });
 
@@ -163,15 +213,15 @@ HTML_CONTENT = """<!DOCTYPE html>
                 for (var i = 0; i < pathPoints.length - 1; i++) {
                     var line = document.createElement('div');
                     line.className = 'path-line';
-                    var p1 = pathPoints[i];
-                    var p2 = pathPoints[i + 1];
+                    var p1 = latLngToPixel(pathPoints[i].lat, pathPoints[i].lng);
+                    var p2 = latLngToPixel(pathPoints[i+1].lat, pathPoints[i+1].lng);
                     var length = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
                     var angle = Math.atan2(p2.y - p1.y, p2.x - p1.x) * 180 / Math.PI;
                     line.style.left = p1.x + 'px';
                     line.style.top = p1.y + 'px';
                     line.style.width = length + 'px';
                     line.style.height = '3px';
-                    line.style.background = 'cyan';
+                    line.style.background = 'repeating-linear-gradient(90deg, cyan, cyan 10px, transparent 10px, transparent 20px)';
                     line.style.boxShadow = '0 0 5px cyan';
                     line.style.transformOrigin = '0 50%';
                     line.style.transform = 'rotate(' + angle + 'deg)';
@@ -181,10 +231,11 @@ HTML_CONTENT = """<!DOCTYPE html>
             }
 
             pathPoints.forEach(function(p) {
+                var pos = latLngToPixel(p.lat, p.lng);
                 var point = document.createElement('div');
                 point.className = 'path-point';
-                point.style.left = p.x + 'px';
-                point.style.top = p.y + 'px';
+                point.style.left = pos.x + 'px';
+                point.style.top = pos.y + 'px';
                 point.style.zIndex = '10';
                 mapEl.appendChild(point);
             });
@@ -206,11 +257,13 @@ HTML_CONTENT = """<!DOCTYPE html>
 
             marker.addEventListener('mousedown', function(e) {
                 isDraggingEmitter = id;
-                var rect = mapEl.getBoundingClientRect();
+                var rect = mapContainer.getBoundingClientRect();
+                var viewportX = e.clientX - rect.left;
+                var viewportY = e.clientY - rect.top;
                 var currentX = parseFloat(marker.style.left);
                 var currentY = parseFloat(marker.style.top);
-                dragOffset.x = e.clientX - rect.left - currentX;
-                dragOffset.y = e.clientY - rect.top - currentY;
+                dragOffset.x = viewportX - (currentX * zoomLevel + panX);
+                dragOffset.y = viewportY - (currentY * zoomLevel + panY);
             });
 
             mapEl.appendChild(marker);
@@ -218,21 +271,27 @@ HTML_CONTENT = """<!DOCTYPE html>
             updateEmitterCoordsPanel();
         }
 
-        // Mouse move for dragging
+        // Mouse move for dragging emitters
         document.addEventListener('mousemove', function(e) {
             if (isDraggingEmitter) {
-                var rect = mapEl.getBoundingClientRect();
-                var x = e.clientX - rect.left - dragOffset.x;
-                var y = e.clientY - rect.top - dragOffset.y;
-
+                var rect = mapContainer.getBoundingClientRect();
+                var viewportX = e.clientX - rect.left;
+                var viewportY = e.clientY - rect.top;
+                var latlng = pixelToLatLng(viewportX, viewportY);
+                
+                var pos = latLngToPixel(latlng.lat, latlng.lng);
                 var marker = emitters[isDraggingEmitter];
-                marker.style.left = x + 'px';
-                marker.style.top = y + 'px';
-
-                var latlng = pixelToLatLng(x, y);
+                marker.style.left = pos.x + 'px';
+                marker.style.top = pos.y + 'px';
                 marker.dataset.lat = latlng.lat;
                 marker.dataset.lng = latlng.lng;
                 updateEmitterCoordsPanel();
+            } else if (isPanning) {
+                var deltaX = e.clientX - panStartX;
+                var deltaY = e.clientY - panStartY;
+                panX = panStartMapX + deltaX;
+                panY = panStartMapY + deltaY;
+                updateMapTransform();
             }
         });
 
@@ -240,6 +299,39 @@ HTML_CONTENT = """<!DOCTYPE html>
         document.addEventListener('mouseup', function() {
             if (isDraggingEmitter) {
                 isDraggingEmitter = null;
+            }
+            isPanning = false;
+        });
+
+        // Mouse wheel for zoom
+        mapContainer.addEventListener('wheel', function(e) {
+            e.preventDefault();
+            var rect = mapContainer.getBoundingClientRect();
+            var x = e.clientX - rect.left;
+            var y = e.clientY - rect.top;
+            
+            var oldZoom = zoomLevel;
+            if (e.deltaY < 0) {
+                zoomLevel = Math.min(zoomLevel * 1.1, MAX_ZOOM);
+            } else {
+                zoomLevel = Math.max(zoomLevel / 1.1, MIN_ZOOM);
+            }
+            
+            // Adjust pan to zoom toward cursor
+            panX -= x * (zoomLevel - oldZoom) / oldZoom;
+            panY -= y * (zoomLevel - oldZoom) / oldZoom;
+            
+            updateMapTransform();
+        }, {passive: false});
+
+        // Right-click + drag for panning
+        mapContainer.addEventListener('mousedown', function(e) {
+            if (e.button === 2) { // Right mouse button
+                isPanning = true;
+                panStartX = e.clientX;
+                panStartY = e.clientY;
+                panStartMapX = panX;
+                panStartMapY = panY;
             }
         });
 
@@ -279,16 +371,14 @@ HTML_CONTENT = """<!DOCTYPE html>
 
         // Get path points as lat/lng
         function getPathPoints() {
-            var latlngs = pathPoints.map(function(p) {
-                return pixelToLatLng(p.x, p.y);
-            });
-            return JSON.stringify(latlngs);
+            return JSON.stringify(pathPoints);
         }
 
         // Generate grid
         function generateGrid() {
-            var w = mapEl.offsetWidth;
-            var h = mapEl.offsetHeight;
+            var dims = getMapDimensions();
+            var w = dims.width;
+            var h = dims.height;
 
             for (var i = 0; i <= 6; i++) {
                 var vLine = document.createElement('div');
@@ -309,8 +399,24 @@ HTML_CONTENT = """<!DOCTYPE html>
             }
         }
 
-        generateGrid();
-        console.log('MAP_READY');
+        // Initialize map dimensions and layout
+        function initMap() {
+            var dims = getMapDimensions();
+            baseWidth = dims.width;
+            baseHeight = dims.height;
+            mapEl.style.width = baseWidth + 'px';
+            mapEl.style.height = baseHeight + 'px';
+            generateGrid();
+            updateMapTransform();
+            console.log('MAP_READY');
+        }
+
+        // Initialize when DOM is ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initMap);
+        } else {
+            initMap();
+        }
     </script>
 </body>
 </html>
